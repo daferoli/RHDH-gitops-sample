@@ -1,0 +1,1037 @@
+---
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: openshift-gitops
+  namespace: openshift-gitops
+spec:
+  kustomizeBuildOptions: --enable-alpha-plugins --load-restrictor LoadRestrictionsNone --helm-command /usr/local/bin/helm
+  extraConfig:
+    resource.compareoptions: |
+      ignoreAggregatedRoles: true
+    application.instanceLabelKey: argocd.argoproj.io/instance
+  server:
+    host: ${ingress_host}
+    autoscale:
+      enabled: false
+    grpc:
+      ingress:
+        enabled: false
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 125m
+        memory: 128Mi
+    insecure: true
+    route:
+      enabled: true
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+    service:
+      type: ""
+  resourceHealthChecks:
+    - group: argoproj.io
+      kind: ApplicationSet
+      check: |
+        local hs = {}
+
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            for i, condition in pairs(obj.status.conditions) do
+              if condition.type == "ErrorOccurred" and condition.status == "True" then
+                hs.status = "Degraded"
+                hs.message = condition.message
+                return hs
+              end
+            end
+            for i, condition in pairs(obj.status.conditions) do
+              if condition.type == "ResourcesUpToDate" and condition.status == "False" then
+                hs.status = "Degraded"
+                hs.message = condition.message
+                return hs
+              end
+            end
+            for i, condition in pairs(obj.status.conditions) do
+              if condition.type == "RolloutProgressing" and condition.status == "True" then
+                hs.status = "Progressing"
+                hs.message = condition.message
+                return hs
+              end
+            end
+            for i, condition in pairs(obj.status.conditions) do
+              if condition.type == "ResourcesUpToDate" and condition.status == "True" then
+                hs.status = "Healthy"
+                hs.message = condition.message
+                return hs
+              end
+            end
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Waiting for the status to be reported"
+        return hs
+    - group: argoproj.io
+      kind: Application
+      check: |
+        hs = {}
+        hs.status = "Progressing"
+        hs.message = ""
+        if obj.status ~= nil then
+          if obj.status.health ~= nil then
+            hs.status = obj.status.health.status
+            if obj.status.health.message ~= nil then
+              hs.message = obj.status.health.message
+            end
+          end
+        end
+        return hs
+    - group: cert-manager.io
+      kind: ClusterIssuer
+      check: |
+        local hs = {}
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            for i, condition in ipairs(obj.status.conditions) do
+              if condition.type == "Ready" and condition.status == "False" then
+                hs.status = "Degraded"
+                hs.message = condition.message
+                return hs
+              end
+              if condition.type == "Ready" and condition.status == "True" then
+                hs.status = "Healthy"
+                hs.message = condition.message
+                return hs
+              end
+            end
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Initializing ClusterIssuer"
+        return hs
+    - group: cert-manager.io
+      kind: Issuer
+      check: |
+        local hs = {}
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            for i, condition in ipairs(obj.status.conditions) do
+              if condition.type == "Ready" and condition.status == "False" then
+                hs.status = "Degraded"
+                hs.message = condition.message
+                return hs
+              end
+              if condition.type == "Ready" and condition.status == "True" then
+                hs.status = "Healthy"
+                hs.message = condition.message
+                return hs
+              end
+            end
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Initializing issuer"
+        return hs
+    - group: cert-manager.io
+      kind: Certificate
+      check: |
+        local hs = {}
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+
+            -- Always Handle Issuing First to ensure consistent behaviour
+            for i, condition in ipairs(obj.status.conditions) do
+              if condition.type == "Issuing" and condition.status == "True" then
+                hs.status = "Progressing"
+                hs.message = condition.message
+                return hs
+              end
+            end
+
+            for i, condition in ipairs(obj.status.conditions) do
+              if condition.type == "Ready" and condition.status == "False" then
+                hs.status = "Degraded"
+                hs.message = condition.message
+                return hs
+              end
+              if condition.type == "Ready" and condition.status == "True" then
+                hs.status = "Healthy"
+                hs.message = condition.message
+                return hs
+              end
+            end
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Waiting for certificate"
+        return hs
+    - group: route.openshift.io
+      kind: Route
+      check: |
+        local health_status = {}
+        if obj.status ~= nil then
+          if obj.status.ingress ~= nil then
+            local numIngressRules = 0
+            local numTrue = 0
+            local numFalse = 0
+            for _, ingressRules in pairs(obj.status.ingress) do
+                numIngressRules = numIngressRules + 1
+                if obj.status.ingress ~= nil then
+                  for _, condition in pairs(ingressRules.conditions) do
+                      if condition.type == "Admitted" and condition.status == "True" then
+                          numTrue = numTrue + 1
+                      elseif condition.type == "Admitted" and condition.status == "False" then
+                          numFalse = numFalse + 1
+                      end
+                  end
+                end
+                health_status.status = 'Test'
+            end
+            if numTrue == numIngressRules then
+              health_status.status = "Healthy"
+              health_status.message = "Route is healthy"
+              return health_status
+            elseif numFalse > 0 then
+              health_status.status = "Degraded"
+              health_status.message = "Route is degraded"
+              return health_status
+            else
+              health_status.status = "Progressing"
+              health_status.message = "Route is still getting admitted"
+              return health_status
+            end
+          end
+        end
+        health_status.status = "Progressing"
+        health_status.message = "Route is still getting admitted"
+        return health_status
+    - group: operators.coreos.com
+      kind: Subscription
+      check: |
+        local health_status = {}
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            local numDegraded = 0
+            local numPending = 0
+            local msg = ""
+            for i, condition in pairs(obj.status.conditions) do
+              msg = msg .. i .. ": " .. condition.type .. " | " .. condition.status .. "\n"
+              if condition.type == "InstallPlanPending" and condition.status == "True" then
+                numPending = numPending + 1
+              elseif (condition.type == "InstallPlanMissing" and condition.reason ~= "ReferencedInstallPlanNotFound") then
+                numDegraded = numDegraded + 1
+              elseif (condition.type == "CatalogSourcesUnhealthy" or condition.type == "InstallPlanFailed" or condition.type == "ResolutionFailed") and condition.status == "True" then
+                numDegraded = numDegraded + 1
+              end
+            end
+
+            -- Available states: undef/nil, UpgradeAvailable, UpgradePending, UpgradeFailed, AtLatestKnown
+            -- Source: https://github.com/openshift/operator-framework-olm/blob/5e2c73b7663d0122c9dc3e59ea39e515a31e2719/staging/api/pkg/operators/v1alpha1/subscription_types.go#L17-L23
+            if obj.status.state == nil  then
+              numPending = numPending + 1
+              msg = msg .. ".status.state not yet known\n"
+            elseif obj.status.state == "" or obj.status.state == "UpgradeAvailable" or obj.status.state == "UpgradePending" then
+              numPending = numPending + 1
+              msg = msg .. ".status.state is '" .. obj.status.state .. "'\n"
+            elseif obj.status.state == "UpgradeFailed" then
+              numDegraded = numDegraded + 1
+              msg = msg .. ".status.state is '" .. obj.status.state .. "'\n"
+            else
+              -- Last possiblity of .status.state: AtLatestKnown
+              msg =  msg .. ".status.state is '" .. obj.status.state .. "'\n"
+            end
+        
+            if obj.status.installedCSV == obj.spec.startingCSV and numPending > 0 and numDegraded == 0 then
+              health_status.status = "Healthy"
+              health_status.message = msg
+              return health_status
+            end
+            if numDegraded == 0 and numPending == 0 then
+              health_status.status = "Healthy"
+              health_status.message = msg
+              return health_status
+            elseif numPending > 0 and numDegraded == 0 then
+              health_status.status = "Progressing"
+              health_status.message = msg
+              return health_status
+            else
+              health_status.status = "Degraded"
+              health_status.message = msg
+              return health_status
+            end
+          end
+        end
+        health_status.status = "Progressing"
+        health_status.message = "An install plan for a subscription is pending installation"
+        return health_status
+
+    - group: operators.coreos.com
+      kind: InstallPlan
+      check: |
+        hs = {}
+        if obj.status ~= nil then
+          if obj.status.phase ~= nil then
+            if obj.status.phase == "Complete" then
+              hs.status = "Healthy"
+              hs.message = obj.status.phase
+              return hs
+            end
+          end
+        end
+        hs.status = "Progressing"
+        hs.message = "Waiting for InstallPlan to complete"
+        return hs
+    - group: maistra.io
+      kind: ServiceMeshControlPlane
+      check: |
+        local health_status = {}
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            for i, condition in pairs(obj.status.conditions) do
+              if condition.reason == "ComponentsReady" and condition.status == "True" then
+                health_status.status = "Healthy"
+                health_status.message = condition.message
+                return health_status
+              end
+              if condition.reason == "ComponentsReady" and condition.status == "False" then
+                health_status.status = "Degraded"
+                health_status.message = condition.message
+                return health_status
+              end
+            end
+          end
+        end
+        health_status.status = "Progressing"
+        health_status.message = "Waiting for Istio Control Plane"
+        return health_status
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      check: |
+        local hs = {}
+
+        function checkConditions(conditions, conditionType)
+          for _, condition in ipairs(conditions) do
+            if condition.type == conditionType and condition.status == "False" then
+              return false, condition.message or ("Failed condition: " .. conditionType)
+            end
+          end
+          return true
+        end
+
+        if obj.status ~= nil then
+          if obj.status.parents ~= nil then
+            for _, parent in ipairs(obj.status.parents) do
+              if parent.conditions ~= nil then
+                local resolvedRefsFalse, resolvedRefsMsg = checkConditions(parent.conditions, "ResolvedRefs")
+                local acceptedFalse, acceptedMsg = checkConditions(parent.conditions, "Accepted")
+
+                if not resolvedRefsFalse then
+                  hs.status = "Degraded"
+                  hs.message = "Parent " .. (parent.parentRef.name or "") .. ": " .. resolvedRefsMsg
+                  return hs
+                end
+
+                if not acceptedFalse then
+                  hs.status = "Degraded"
+                  hs.message = "Parent " .. (parent.parentRef.name or "") .. ": " .. acceptedMsg
+                  return hs
+                end
+
+                local isProgressing = false
+                local progressingMsg = ""
+
+                for _, condition in ipairs(parent.conditions) do
+                  if condition.type == "Programmed" and condition.status ~= "True" then
+                    isProgressing = true
+                    progressingMsg = condition.message or "Route is still being programmed"
+                    break
+                  end
+                end
+
+                if isProgressing then
+                  hs.status = "Progressing"
+                  hs.message = "Parent " .. (parent.parentRef.name or "") .. ": " .. progressingMsg
+                  return hs
+                end
+              end
+            end
+
+            if #obj.status.parents > 0 then
+              for _, parent in ipairs(obj.status.parents) do
+                if parent.conditions ~= nil and #parent.conditions > 0 then
+                  hs.status = "Healthy"
+                  hs.message = "GRPCRoute is healthy"
+                  return hs
+                end
+              end
+            end
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Waiting for GRPCRoute status"
+        return hs
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      check: |
+        local hs = {}
+
+        function checkConditions(conditions, conditionType)
+          for _, condition in ipairs(conditions) do
+            if condition.type == conditionType and condition.status == "False" then
+              return false, condition.message or ("Failed condition: " .. conditionType)
+            end
+          end
+          return true
+        end
+
+        -- isParentGenerationObserved checks if a parent's conditions match the current resource generation
+        -- For HTTPRoute, observedGeneration is stored in each condition within a parent
+        function isParentGenerationObserved(obj, parent)
+          if obj.metadata.generation == nil then
+            -- If no generation is set, accept all conditions
+            return true
+          end
+
+          if parent.conditions == nil or #parent.conditions == 0 then
+            return false
+          end
+
+          -- Check if all conditions have observedGeneration matching current generation
+          for _, condition in ipairs(parent.conditions) do
+            if condition.observedGeneration ~= nil then
+              if condition.observedGeneration ~= obj.metadata.generation then
+                return false
+              end
+            end
+          end
+
+          return true
+        end
+
+        if obj.status ~= nil then
+          if obj.status.parents ~= nil then
+            for _, parent in ipairs(obj.status.parents) do
+              if parent.conditions ~= nil then
+                -- Skip this parent if it's not from the current generation
+                if not isParentGenerationObserved(obj, parent) then
+                  goto continue
+                end
+
+                local resolvedRefsFalse, resolvedRefsMsg = checkConditions(parent.conditions, "ResolvedRefs")
+                local acceptedFalse, acceptedMsg = checkConditions(parent.conditions, "Accepted")
+
+                if not resolvedRefsFalse then
+                  hs.status = "Degraded"
+                  hs.message = "Parent " .. (parent.parentRef.name or "") .. ": " .. resolvedRefsMsg
+                  return hs
+                end
+
+                if not acceptedFalse then
+                  hs.status = "Degraded"
+                  hs.message = "Parent " .. (parent.parentRef.name or "") .. ": " .. acceptedMsg
+                  return hs
+                end
+
+                local isProgressing = false
+                local progressingMsg = ""
+
+                for _, condition in ipairs(parent.conditions) do
+                  if condition.type == "Programmed" and condition.status ~= "True" then
+                    isProgressing = true
+                    progressingMsg = condition.message or "Route is still being programmed"
+                    break
+                  end
+                end
+
+                if isProgressing then
+                  hs.status = "Progressing"
+                  hs.message = "Parent " .. (parent.parentRef.name or "") .. ": " .. progressingMsg
+                  return hs
+                end
+
+                ::continue::
+              end
+            end
+
+            if #obj.status.parents > 0 then
+              for _, parent in ipairs(obj.status.parents) do
+                if parent.conditions ~= nil and #parent.conditions > 0 then
+                  -- Only mark as healthy if we found a parent from the current generation
+                  if isParentGenerationObserved(obj, parent) then
+                    hs.status = "Healthy"
+                    hs.message = "HTTPRoute is healthy"
+                    return hs
+                  end
+                end
+              end
+            end
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Waiting for HTTPRoute status"
+        return hs
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      check: |
+        local hs = {}
+
+        function checkConditions(conditions, conditionType)
+          for _, condition in ipairs(conditions) do
+            if condition.type == conditionType and condition.status == "False" then
+              return false, condition.message or ("Failed condition: " .. conditionType)
+            end
+          end
+          return true
+        end
+
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            local resolvedRefsFalse, resolvedRefsMsg = checkConditions(obj.status.conditions, "ResolvedRefs")
+            local acceptedFalse, acceptedMsg = checkConditions(obj.status.conditions, "Accepted")
+
+            if not resolvedRefsFalse then
+              hs.status = "Degraded"
+              hs.message = resolvedRefsMsg
+              return hs
+            end
+
+            if not acceptedFalse then
+              hs.status = "Degraded"
+              hs.message = acceptedMsg
+              return hs
+            end
+
+            local isProgressing = false
+            local progressingMsg = ""
+
+            for _, condition in ipairs(obj.status.conditions) do
+              if condition.type == "Programmed" and condition.status ~= "True" then
+                isProgressing = true
+                progressingMsg = condition.message or "Gateway is still being programmed"
+                break
+              end
+            end
+
+            if isProgressing then
+              hs.status = "Progressing"
+              hs.message = progressingMsg
+              return hs
+            end
+          end
+
+          if obj.status.listeners ~= nil then
+            for _, listener in ipairs(obj.status.listeners) do
+              if listener.conditions ~= nil then
+                local resolvedRefsFalse, resolvedRefsMsg = checkConditions(listener.conditions, "ResolvedRefs")
+                local acceptedFalse, acceptedMsg = checkConditions(listener.conditions, "Accepted")
+
+                if not resolvedRefsFalse then
+                  hs.status = "Degraded"
+                  hs.message = "Listener: " .. resolvedRefsMsg
+                  return hs
+                end
+
+                if not acceptedFalse then
+                  hs.status = "Degraded"
+                  hs.message = "Listener: " .. acceptedMsg
+                  return hs
+                end
+
+                local isProgressing = false
+                local progressingMsg = ""
+
+                for _, condition in ipairs(listener.conditions) do
+                  if condition.type == "Programmed" and condition.status ~= "True" then
+                    isProgressing = true
+                    progressingMsg = condition.message or "Listener is still being programmed"
+                    break
+                  end
+                end
+
+                if isProgressing then
+                  hs.status = "Progressing"
+                  hs.message = "Listener: " .. progressingMsg
+                  return hs
+                end
+              end
+            end
+          end
+
+          if obj.status.conditions ~= nil or (obj.status.listeners ~= nil and #obj.status.listeners > 0) then
+            hs.status = "Healthy"
+            hs.message = "Gateway is healthy"
+            return hs
+          end
+        end
+
+        hs.status = "Progressing"
+        hs.message = "Waiting for Gateway status"
+        return hs
+    - group: kiali.io
+      kind: Kiali
+      check: |
+        local health_status = {}
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            for i, condition in ipairs(obj.status.conditions) do
+              health_status.message = condition.message
+              if condition.type == "Successful" and condition.status == "True" then
+                health_status.status = "Healthy"
+                return health_status
+              end
+              if condition.type == "Failure" and condition.status == "True" then
+                health_status.status = "Degraded"
+                return health_status
+              end
+              if condition.type == "Running" and condition.reason == "Running" then
+                health_status.status = "Progressing"
+                return health_status
+              end
+            end
+          end
+        end
+        health_status.status = "Progressing"
+        health_status.message = "Waiting for Kiali"
+        return health_status
+    - group: minio.min.io
+      kind: Tenant
+      check: |
+        local health_status = {}
+        if obj.status ~= nil then
+            if obj.status.currentState ~= nil then
+                if obj.status.currentState == "Initialized" then
+                    health_status.status = "Healthy"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState:find("^Provisioning") ~= nil then
+                    health_status.status = "Progressing"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState:find("^Waiting") ~= nil then
+                    health_status.status = "Progressing"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState:find("^Updating") ~= nil then
+                    health_status.status = "Progressing"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState == "Restarting MinIO" then
+                    health_status.status = "Progressing"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState == "Statefulset not controlled by operator" then
+                    health_status.status = "Degraded"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState == "Another MinIO Tenant already exists in the namespace" then
+                    health_status.status = "Degraded"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState == "Tenant credentials are not set properly" then
+                    health_status.status = "Degraded"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState == "Different versions across MinIO Pools" then
+                    health_status.status = "Degraded"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                if obj.status.currentState == "Pool Decommissioning Not Allowed" then
+                    health_status.status = "Degraded"
+                    health_status.message = obj.status.currentState
+                    return health_status
+                end
+                health_status.status = "Progressing"
+                health_status.message = obj.status.currentState
+                return health_status
+            end
+        end
+        health_status.status = "Progressing"
+        health_status.message = "No status info available"
+        return health_status
+
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      check: |
+        local hs = {}
+
+        -- Check if CRD is terminating
+        if obj.metadata.deletionTimestamp ~= nil then
+            hs.status = "Progressing"
+            hs.message = "CRD is terminating"
+            return hs
+        end
+
+        if obj.status.conditions == nil then
+            hs.status = "Progressing"
+            hs.message = "Status conditions not found"
+            return hs
+        end
+
+        if #obj.status.conditions == 0 then
+            hs.status = "Progressing"
+            hs.message = "Status conditions not found"
+            return hs
+        end
+
+        local isEstablished
+        local conditionMsg = ""
+
+        for _, condition in pairs(obj.status.conditions) do
+
+            -- Check if CRD is terminating
+            if condition.type == "Terminating" and condition.status == "True" then
+                hs.status = "Progressing"
+                hs.message = "CRD is terminating: " .. condition.message
+                return hs
+            end
+
+            -- Check if K8s has accepted names for this CRD
+            if condition.type == "NamesAccepted" and condition.status == "False" then
+                hs.status = "Degraded"
+                hs.message = "CRD names have not been accepted: " .. condition.message
+                return hs
+            end
+
+            -- Checking if CRD has violations
+            if condition.type == "NonStructuralSchema" and condition.status == "True" then
+                hs.status = "Degraded"
+                hs.message = "Schema violations found: " .. condition.message
+                return hs
+            end
+
+            -- Checking if CRD is established
+            if condition.type == "Established" and condition.status == "True" then
+                isEstablished = true
+                conditionMsg = condition.message
+            end
+        end
+
+        if not isEstablished then
+            hs.status = "Degraded"
+            hs.message = "CRD is not established"
+            return hs
+        end
+
+        hs.status = "Healthy"
+        hs.message = "CRD is healthy"
+        return hs
+
+    - group: monitoring.coreos.com
+      kind: Prometheus
+      check: |
+        local hs={ status = "Progressing", message = "Waiting for initialization" }
+
+        if obj.status ~= nil then
+          if obj.status.conditions ~= nil then
+            for i, condition in ipairs(obj.status.conditions) do
+
+              if condition.type == "Available" and condition.status ~= "True" then
+                if condition.reason == "SomePodsNotReady" then
+                  hs.status = "Progressing"
+                else
+                  hs.status = "Degraded"
+                end
+                hs.message = condition.message or condition.reason
+              end
+              if condition.type == "Available" and condition.status == "True" then
+                hs.status = "Healthy"
+                hs.message = "All instances are available"
+              end
+            end
+          end
+        end
+
+        return hs
+    - group: grafana.integreatly.org
+      kind: Grafana
+      check: |
+        -- if no status info available yet, assume progressing
+        if obj.status == nil or obj.status.stageStatus == nil then
+          return {
+            status = "Progressing",
+            message = "Waiting for Grafana status info",
+          }
+        end
+
+        -- if last stage failed, we are stuck here
+        if obj.status.stageStatus == "failed" then
+          return {
+            status = "Degraded",
+            message = "Failed at stage " .. obj.status.stage,
+          }
+        end
+
+        -- only if "complete" stage was successful, Grafana can be considered healthy
+        if obj.status.stage == "complete" and obj.status.stageStatus == "success" then
+          return {
+            status = "Healthy",
+            message = "",
+          }
+        end
+
+        -- no final status yet, assume progressing
+        return {
+          status = "Progressing",
+          message = obj.status.stage,
+        }
+    - group: grafana.integreatly.org
+      kind: GrafanaDashboard
+      check: |
+        -- Reference CRD can be found here:
+        -- https://grafana.github.io/grafana-operator/docs/api/#grafanadashboard
+
+        function getStatusFromConditions(obj, hs)
+          if obj.status ~= nil and obj.status.conditions ~= nil then
+              for i, condition in ipairs(obj.status.conditions) do
+                  if condition.status ~= nil then
+                    if hs.message ~= "" then
+                      hs.message = hs.message .. ", "
+                    end
+
+                    if condition.reason ~= nil then
+                      hs.message = hs.message .. condition.reason
+                      if condition.type ~= nil then
+                          hs.message = hs.message .. " for " .. condition.type
+                        if condition.message ~= nil then
+                            hs.message = hs.message .. " because " .. condition.message
+                        end
+                      end
+                    end
+
+                    if condition.status == "False" then
+                      hs.status = "Degraded"
+                      return hs
+                    end
+
+                    if condition.status == "True" then
+                      hs.status = "Healthy"
+                    end
+                  end
+              end
+          end
+
+          return hs
+        end
+
+        local hs = {}
+        hs.status = "Progressing"
+        hs.message = ""
+
+        hs = getStatusFromConditions(obj, hs)
+
+        return hs
+
+    - group: grafana.integreatly.org
+      kind: GrafanaDataSource
+      check: |
+        -- if UID not yet created, we are progressing
+        if obj.status == nil or obj.status.uid == "" then
+          return {
+            status = "Progressing",
+            message = "",
+          }
+        end
+
+        -- NoMatchingInstances distinguishes if we are healthy or degraded
+        if obj.status.NoMatchingInstances then
+          return {
+            status = "Degraded",
+            message = "can't find matching grafana instance",
+          }
+        end
+        return {
+          status = "Healthy",
+          message = "",
+        }
+    - group: grafana.integreatly.org
+      kind: GrafanaFolder
+      check: |
+        -- Reference CRD can be found here:
+        -- https://grafana.github.io/grafana-operator/docs/api/#grafanafolder
+
+        function getStatusFromConditions(obj, hs)
+          if obj.status ~= nil and obj.status.conditions ~= nil then
+              for i, condition in ipairs(obj.status.conditions) do
+                  if condition.status ~= nil then
+                    if hs.message ~= "" then
+                      hs.message = hs.message .. ", "
+                    end
+
+                    if condition.reason ~= nil then
+                      hs.message = hs.message .. condition.reason
+                      if condition.type ~= nil then
+                          hs.message = hs.message .. " for " .. condition.type
+                        if condition.message ~= nil then
+                            hs.message = hs.message .. " because " .. condition.message
+                        end
+                      end
+                    end
+
+                    if condition.status == "False" then
+                      hs.status = "Degraded"
+                      return hs
+                    end
+
+                    if condition.status == "True" then
+                      hs.status = "Healthy"
+                    end
+                  end
+              end
+          end
+
+          return hs
+        end
+
+        local hs = {}
+        hs.status = "Progressing"
+        hs.message = ""
+
+        hs = getStatusFromConditions(obj, hs)
+
+        return hs
+
+  grafana:
+    enabled: false
+    ingress:
+      enabled: false
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 250m
+        memory: 128Mi
+    route:
+      enabled: false
+  prometheus:
+    enabled: false
+    ingress:
+      enabled: false
+    route:
+      enabled: false
+  initialSSHKnownHosts: {}
+  applicationSet:
+    enabled: false
+    #extraCommandArgs:
+    #  - --enable-progressive-syncs
+    resources:
+      limits:
+        cpu: "2"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 512Mi
+  rbac:
+    defaultPolicy: 'role:admin'
+    policy: |
+      g, system:cluster-admins, role:admin
+      g, openshift-admins, role:admin
+    scopes: "[groups]"
+  repo:
+    volumes:
+      - emptyDir: {}
+        name: policy-generator
+    initContainers:
+      - args:
+        - -c
+        - cp /etc/kustomize/plugin/policy.open-cluster-management.io/v1/policygenerator/PolicyGenerator
+          /policy-generator/PolicyGenerator
+        command:
+          - /bin/bash
+        image: registry.redhat.io/rhacm2/multicluster-operators-subscription-rhel8:v2.7
+        name: policy-generator-install
+        volumeMounts:
+          - mountPath: /policy-generator
+            name: policy-generator
+    volumeMounts:
+      - mountPath: /.config/kustomize/plugin/policy.open-cluster-management.io/v1/policygenerator
+        name: policy-generator
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 256Mi
+  resourceExclusions: |
+    - apiGroups:
+      - internal.open-cluster-management.io
+      kinds:
+      - ManagedClusterInfo
+      clusters:
+      - "*"
+    - apiGroups:
+      - tekton.dev
+      clusters:
+      - '*'
+      kinds:
+      - TaskRun
+      - PipelineRun
+  sso:
+    dex:
+      resources:
+        limits:
+          cpu: 500m
+          memory: 256Mi
+        requests:
+          cpu: 250m
+          memory: 128Mi
+      openShiftOAuth: true
+    provider: dex
+  ha:
+    enabled: false
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 250m
+        memory: 128Mi
+  tls:
+    ca: {}
+  redis:
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 250m
+        memory: 128Mi
+  controller:
+    processors: {}
+    resources:
+      limits:
+        cpu: "2"
+        memory: 2Gi
+      requests:
+        cpu: 250m
+        memory: 1Gi
+    sharding:
+      enabled: true
+      replicas: 2
+      # dynamicScalingEnabled: true
+      # minShards: 2
+      # maxShards: 2
+      clustersPerShard: 1
+    env:
+      - name: ARGOCD_CONTROLLER_SHARDING_ALGORITHM
+        # value: round-robin
+        value: consistent-hashing
+    logLevel: debug
